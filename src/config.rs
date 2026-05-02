@@ -6,7 +6,7 @@ use ts_rs::TS;
 #[derive(Clone, TS, Serialize, Deserialize, Debug)]
 #[ts(export, export_to = "web/src/bindings/")]
 pub struct Config {
-    pub ytarchive: YtarchiveConfig,
+    pub ytdlp: YtdlpConfig,
     pub scraper: ScraperConfig,
     pub notifier: Option<NotifierConfig>,
     pub webserver: Option<WebserverConfig>,
@@ -17,21 +17,23 @@ pub struct Config {
     config_path: String,
 }
 
+fn default_delay_start() -> std::time::Duration {
+    std::time::Duration::from_secs(1)
+}
+
 #[derive(Clone, TS, Serialize, Deserialize, Debug)]
 #[ts(export, export_to = "web/src/bindings/")]
-pub struct YtarchiveConfig {
+pub struct YtdlpConfig {
     pub executable_path: String,
     pub working_directory: String,
     pub args: Vec<String>,
-    pub quality: String,
+    pub format: String,
     #[serde(with = "humantime_serde")]
     #[serde(default = "default_delay_start")]
     #[ts(type = "string")]
     pub delay_start: std::time::Duration,
-}
-
-fn default_delay_start() -> std::time::Duration {
-    std::time::Duration::from_secs(1)
+    /// Path to a Netscape-format cookies file (e.g. for member-only streams)
+    pub cookies_file: Option<String>,
 }
 
 #[derive(Clone, TS, Serialize, Deserialize, Debug)]

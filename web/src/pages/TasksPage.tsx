@@ -37,7 +37,7 @@ const TaskStateBadge = ({ state }: { state: YTAState }) => (
         ? 'blue'
         : state === 'Muxing'
         ? 'yellow'
-        : state === 'Idle' || state === 'AlreadyProcessed' || state === 'Ended'
+        : state === 'Idle' || state === 'AlreadyProcessed'
         ? 'gray'
         : state === 'Interrupted' || state === 'Errored'
         ? 'red'

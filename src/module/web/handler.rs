@@ -13,7 +13,7 @@ use actix_web::{
 };
 use anyhow::anyhow;
 use serde::Deserialize;
-use std::sync::Arc;
+use std::{process::Stdio, sync::Arc};
 use tokio::sync::RwLock;
 use ts_rs::TS;
 
@@ -54,10 +54,10 @@ struct CreateTaskRequest {
 #[post("/api/task")]
 async fn post_task(
     tx: Data<BusTx<Message>>,
+    config: Data<Arc<RwLock<Config>>>,
     taskreq: web::Json<CreateTaskRequest>,
 ) -> actix_web::Result<impl Responder> {
     let taskreq = taskreq.into_inner();
-    let client = reqwest::Client::new();
 
     // Make sure the video URL is valid
     let url =
@@ -67,39 +67,73 @@ async fn post_task(
         .ok_or(ErrorBadRequest(anyhow!("Not a video URL")))?;
     let video_url = format!("https://www.youtube.com/watch?v={}", video_id);
 
-    // Fetch video details
-    let ipr = youtube::video::fetch_initial_player_response(client.clone(), &video_url)
+    // Fetch video metadata via yt-dlp --dump-json (avoids fragile HTML scraping)
+    info!("Fetching video metadata for {} via yt-dlp", video_id);
+    let cfg = config.read().await.ytdlp.clone();
+    let mut cmd_args = vec![
+        "--dump-json".to_string(),
+        "--no-playlist".to_string(),
+        "--js-runtimes".to_string(),
+        "node".to_string(),
+    ];
+    if let Some(ref cookies) = cfg.cookies_file {
+        let abs_cookies = std::fs::canonicalize(cookies)
+            .unwrap_or_else(|_| std::path::PathBuf::from(cookies));
+        cmd_args.push("--cookies".to_string());
+        cmd_args.push(abs_cookies.to_string_lossy().to_string());
+    }
+    cmd_args.push(video_url);
+
+    let output = tokio::process::Command::new(&cfg.executable_path)
+        .args(&cmd_args)
+        .current_dir(&cfg.working_directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
         .await
-        .map_err(|e| ErrorInternalServerError(format!("{:?}", e)))?;
+        .map_err(|e| ErrorInternalServerError(format!("Failed to run yt-dlp: {:?}", e)))?;
 
-    // Get the best thumbnail
-    let mut thumbs = ipr.video_details.thumbnail.thumbnails;
-    thumbs.sort_by_key(|t| t.width);
-    let best_thumb = thumbs.last().map(|t| t.url.clone()).unwrap_or("".into());
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        error!("yt-dlp --dump-json failed for {}: {}", video_id, stderr);
+        return Err(ErrorInternalServerError(format!(
+            "yt-dlp failed: {}",
+            stderr.lines().last().unwrap_or("unknown error")
+        )));
+    }
 
-    // Fetch the channel image
-    let channel_picture =
-        youtube::channel::fetch_picture_url(client, &ipr.video_details.channel_id)
-            .await
-            .map_err(|e| {
-                ErrorInternalServerError(anyhow!("Failed to fetch channel picture: {:?}", e))
-            })?;
+    #[derive(Deserialize)]
+    struct YtDlpMeta {
+        id: String,
+        title: String,
+        uploader: String,
+        channel_id: String,
+        thumbnail: Option<String>,
+    }
 
-    // Create the task
+    let meta: YtDlpMeta = serde_json::from_slice(&output.stdout)
+        .map_err(|e| ErrorInternalServerError(format!("Failed to parse yt-dlp output: {:?}", e)))?;
+
+    info!("Got metadata: {} / {}", meta.title, meta.channel_id);
+
     let task = Task {
-        title: ipr.video_details.title,
-        video_id: ipr.video_details.video_id,
-        video_picture: best_thumb,
-        channel_name: ipr.video_details.author,
-        channel_id: ipr.video_details.channel_id,
-        channel_picture: Some(channel_picture),
+        title: meta.title,
+        video_id: meta.id,
+        video_picture: meta.thumbnail.unwrap_or_default(),
+        channel_name: meta.uploader,
+        channel_id: meta.channel_id,
+        channel_picture: None,
         output_directory: taskreq.output_directory,
     };
 
-    // Broadcast it to the bus
+    info!("Queuing task for {}", task.video_id);
     tx.send(Message::ToRecord(task))
         .await
-        .map_err(|e| ErrorInternalServerError(format!("{:?}", e)))?;
+        .map_err(|e| {
+            error!("Failed to queue task: {:?}", e);
+            ErrorInternalServerError(format!("{:?}", e))
+        })?;
 
     Ok(HttpResponse::Accepted().finish())
 }

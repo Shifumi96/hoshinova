@@ -29,7 +29,7 @@ pub static APP_USER_AGENT: &str = concat!(
     ")"
 );
 
-/// Garbage ytarchive manager
+/// yt-dlp livestream recorder manager
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
@@ -57,19 +57,19 @@ fn test_ffmpeg() -> Result<String> {
         .join(" "))
 }
 
-fn test_ytarchive(path: &str) -> Result<String> {
+fn test_ytdlp(path: &str) -> Result<String> {
     let cmd = Command::new(path)
         .arg("--version")
         .output()
-        .map_err(|e| anyhow!("Failed to execute ytarchive: {}", e))?;
+        .map_err(|e| anyhow!("Failed to execute yt-dlp: {}", e))?;
     if !cmd.status.success() {
         return Err(anyhow!(
-            "Failed to determine ytarchive version: {}",
+            "Failed to determine yt-dlp version: {}",
             cmd.status
         ));
     }
     let stdout = String::from_utf8_lossy(&cmd.stdout);
-    Ok(stdout.trim().to_string())
+    Ok(format!("yt-dlp {}", stdout.trim()))
 }
 
 #[tokio::main]
@@ -90,12 +90,9 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow!("Failed to read config file: {}", e))?;
     debug!("{:?}", config);
 
-    // Make sure ffmpeg and ytarchive are installed
+    // Make sure ffmpeg and yt-dlp are installed
     debug!("Found {}", test_ffmpeg()?);
-    debug!(
-        "Found {}",
-        test_ytarchive(&config.ytarchive.executable_path)?
-    );
+    debug!("Found {}", test_ytdlp(&config.ytdlp.executable_path)?);
 
     // Set up message bus
     let mut bus = MessageBus::new(65_536);
@@ -116,7 +113,7 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(RwLock::new(config));
     let h_scraper = run_module!(bus, module::scraper::RSS::new(config.clone()));
-    let h_recorder = run_module!(bus, module::recorder::YTArchive::new(config.clone()));
+    let h_recorder = run_module!(bus, module::recorder::YtDlp::new(config.clone()));
     let h_notifier = run_module!(bus, module::notifier::Discord::new(config.clone()));
     let h_webserver = run_module!(bus, module::web::WebServer::new(config.clone()));
 

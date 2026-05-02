@@ -21,7 +21,6 @@ const stateSort: ReturnType<typeof stateKey>[] = [
   'Waiting',
   'Finished',
   'Idle',
-  'Ended',
   'AlreadyProcessed',
   'Interrupted',
 ];

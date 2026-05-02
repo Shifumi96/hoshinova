@@ -23,17 +23,17 @@ use tokio::{
 };
 use ts_rs::TS;
 
-pub struct YTArchive {
+pub struct YtDlp {
     config: Arc<RwLock<Config>>,
     active_ids: Arc<RwLock<HashSet<String>>>,
 }
 
-impl YTArchive {
+impl YtDlp {
     async fn record(cfg: Config, task: Task, bus: &mut BusTx<Message>) -> Result<()> {
         let task_name = format!("[{}][{}][{}]", task.video_id, task.channel_name, task.title);
 
         // Ensure the working directory exists
-        let cfg = cfg.ytarchive;
+        let cfg = &cfg.ytdlp;
         tokio::fs::create_dir_all(&cfg.working_directory)
             .await
             .context("Failed to create working directory")?;
@@ -46,26 +46,44 @@ impl YTArchive {
         // Construct the command line arguments
         let mut args = cfg.args.clone();
 
-        // Add the --wait flag if not present
-        if !args.contains(&"-w".to_string()) && !args.contains(&"--wait".to_string()) {
-            args.push("--wait".to_string());
+        // Add --wait-for-video if not present
+        if !args.iter().any(|a| a == "--wait-for-video") {
+            args.push("--wait-for-video".to_string());
+            args.push("30".to_string());
         }
 
-        args.extend(vec![
-            format!("https://youtu.be/{}", task.video_id),
-            cfg.quality.clone(),
-        ]);
+        // Cookies for member-only streams
+        if let Some(ref path) = cfg.cookies_file {
+            if !args.iter().any(|a| a == "--cookies") {
+                // Resolve to absolute path so it works regardless of yt-dlp's working_directory
+                let abs_cookies = std::fs::canonicalize(path)
+                    .unwrap_or_else(|_| std::path::PathBuf::from(path));
+                args.push("--cookies".to_string());
+                args.push(abs_cookies.to_string_lossy().to_string());
+            }
+        }
+
+        // Add format selector
+        if !cfg.format.is_empty() && !args.iter().any(|a| a == "-f" || a == "--format") {
+            args.push("-f".to_string());
+            args.push(cfg.format.clone());
+        }
+
+        // URL last
+        args.push(format!("https://youtu.be/{}", task.video_id));
 
         // Start the process
-        debug!("{} Starting ytarchive with args {:?}", task_name, args);
+        debug!("{} Starting yt-dlp with args {:?}", task_name, args);
         let mut process = tokio::process::Command::new(&cfg.executable_path)
             .args(args)
             .current_dir(&cfg.working_directory)
+            // Disable Python output buffering so we get lines in real time
+            .env("PYTHONUNBUFFERED", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .context("Failed to start ytarchive")?;
+            .context("Failed to start yt-dlp")?;;
 
         // Grab stdout/stderr byte iterators
         let mut stdout = BufReader::new(
@@ -174,6 +192,15 @@ impl YTArchive {
 
         // Parse each line
         let mut status = YTAStatus::new();
+
+        // Send an initial status so the UI shows the task immediately
+        let _ = bus
+            .send(Message::RecordingStatus(RecordingStatus {
+                task: task.clone(),
+                status: status.clone(),
+            }))
+            .await;
+
         loop {
             let line = match rx.recv().await {
                 Some(line) => line,
@@ -185,7 +212,7 @@ impl YTArchive {
                 break;
             }
 
-            trace!("{}[yta:out] {}", task_name, line);
+            trace!("{}[ytdlp:out] {}", task_name, line);
 
             let old = status.clone();
             status.parse_line(&line);
@@ -209,10 +236,17 @@ impl YTArchive {
             let message = match status.state {
                 YTAState::Waiting(_) => {
                     info!("{} Waiting for stream to go live", task_name);
-                    Some(Message::ToNotify(Notification {
-                        task: task.clone(),
-                        status: TaskStatus::Waiting,
-                    }))
+                    // Only notify on the first Waiting transition (from Idle).
+                    // Subsequent AlreadyProcessed → Waiting cycles (stream still
+                    // processing on YouTube's side) should not spam Discord.
+                    if old.state == YTAState::Idle {
+                        Some(Message::ToNotify(Notification {
+                            task: task.clone(),
+                            status: TaskStatus::Waiting,
+                        }))
+                    } else {
+                        None
+                    }
                 }
                 YTAState::Recording => {
                     info!("{} Recording started", task_name);
@@ -220,6 +254,10 @@ impl YTArchive {
                         task: task.clone(),
                         status: TaskStatus::Recording,
                     }))
+                }
+                YTAState::Muxing => {
+                    info!("{} Muxing", task_name);
+                    None
                 }
                 YTAState::Finished => {
                     info!("{} Recording finished", task_name);
@@ -233,7 +271,14 @@ impl YTArchive {
                     None
                 }
                 YTAState::Interrupted => {
-                    info!("{} Recording failed: interrupted", task_name);
+                    info!("{} Recording interrupted", task_name);
+                    Some(Message::ToNotify(Notification {
+                        task: task.clone(),
+                        status: TaskStatus::Failed,
+                    }))
+                }
+                YTAState::Errored => {
+                    info!("{} Recording failed", task_name);
                     Some(Message::ToNotify(Notification {
                         task: task.clone(),
                         status: TaskStatus::Failed,
@@ -258,16 +303,86 @@ impl YTArchive {
         trace!("{} Stdout monitor quit: {:?}", task_name, r_stdout);
         trace!("{} Stderr monitor quit: {:?}", task_name, r_stderr);
 
+        // Check process exit code
+        let exit_ok = r_wait
+            .ok()
+            .and_then(|r| r.ok())
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        // Mark as finished when process exits successfully
+        if exit_ok
+            && matches!(
+                status.state,
+                YTAState::Recording | YTAState::Muxing | YTAState::Idle
+            )
+        {
+            status.state = YTAState::Finished;
+            let _ = bus
+                .send(Message::ToNotify(Notification {
+                    task: task.clone(),
+                    status: TaskStatus::Done,
+                }))
+                .await;
+        }
+
+        // Push final status to the UI
+        let _ = bus
+            .send(Message::RecordingStatus(RecordingStatus {
+                task: task.clone(),
+                status: status.clone(),
+            }))
+            .await;
+
         // Skip moving files if it didn't finish
         if status.state != YTAState::Finished {
             return Ok(());
         }
 
         // Move the video to the output directory
-        let frompath = status
-            .output_file
-            .ok_or(anyhow!("ytarchive did not emit an output file"))?;
-        let frompath = Path::new(&frompath);
+        let frompath_str = status.output_file;
+        // Resolve the captured path, then fall back to scanning by video ID
+        let frompath_buf = if let Some(ref s) = frompath_str {
+            let candidate = if Path::new(s).is_absolute() {
+                std::path::PathBuf::from(s)
+            } else {
+                Path::new(&cfg.working_directory).join(s)
+            };
+            if candidate.exists() {
+                Some(candidate)
+            } else {
+                warn!("{} Output file not found at {:?}, searching by video ID", task_name, candidate);
+                None
+            }
+        } else {
+            warn!("{} yt-dlp did not emit an output file path, searching by video ID", task_name);
+            None
+        };
+
+        // Fallback: scan working directory for a file containing the video ID
+        let frompath_buf = if let Some(buf) = frompath_buf {
+            buf
+        } else {
+            let mut found = None;
+            if let Ok(entries) = fs::read_dir(&cfg.working_directory) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy().to_string();
+                    if name_str.contains(&task.video_id)
+                        && !name_str.ends_with(".part")
+                        && !name_str.contains(".frag")
+                        && !name_str.ends_with(".ytdl")
+                    {
+                        found = Some(entry.path());
+                        break;
+                    }
+                }
+            }
+            found.ok_or_else(|| anyhow!("Could not find output file for video {}", task.video_id))?
+        };
+
+        let frompath = frompath_buf.as_path();
+        debug!("{} Moving output file from {:?}", task_name, frompath);
         let filename = frompath
             .file_name()
             .ok_or(anyhow!("Failed to get filename"))?;
@@ -304,7 +419,7 @@ struct SpawnTask {
 }
 
 #[async_trait]
-impl Module for YTArchive {
+impl Module for YtDlp {
     fn new(config: Arc<RwLock<Config>>) -> Self {
         let active_ids = Arc::new(RwLock::new(HashSet::new()));
         Self { config, active_ids }
@@ -319,14 +434,14 @@ impl Module for YTArchive {
         let f_spawner = async move {
             while let Some(mut task) = spawn_rx.recv().await {
                 let active_ids = active_ids.clone();
-                let delay = task.cfg.ytarchive.delay_start;
+                let delay = task.cfg.ytdlp.delay_start;
 
-                debug!("Spawning thread for task: {:?}", task.task);
+                debug!("Spawning yt-dlp thread for task: {:?}", task.task);
                 tokio::spawn(async move {
                     let video_id = task.task.video_id.clone();
                     active_ids.write().await.insert(video_id.clone());
 
-                    if let Err(e) = YTArchive::record(task.cfg, task.task, &mut task.tx).await {
+                    if let Err(e) = YtDlp::record(task.cfg, task.task, &mut task.tx).await {
                         error!("Failed to record task: {:?}", e);
                     };
 
@@ -353,8 +468,7 @@ impl Module for YTArchive {
 
                         debug!("Adding task to spawn queue: {:?}", task);
                         let tx = tx.clone();
-                        let cfg = self.config.read().await;
-                        let cfg = cfg.clone();
+                        let cfg = self.config.read().await.clone();
 
                         if let Err(_) = spawn_tx.send(SpawnTask { task, cfg, tx }) {
                             debug!("Spawn queue closed, exiting");
@@ -371,12 +485,12 @@ impl Module for YTArchive {
         // Run the futures
         tokio::try_join!(f_spawner, f_message)?;
 
-        debug!("YTArchive module finished");
+        debug!("YtDlp module finished");
         Ok(())
     }
 }
 
-/// The current state of ytarchive.
+/// The current recording status.
 #[derive(Debug, Clone, TS, Serialize)]
 #[ts(export, export_to = "web/src/bindings/")]
 pub struct YTAStatus {
@@ -400,7 +514,6 @@ pub enum YTAState {
     Muxing,
     Finished,
     AlreadyProcessed,
-    Ended,
     Interrupted,
     Errored,
 }
@@ -436,101 +549,102 @@ impl YTAStatus {
         }
     }
 
-    /// parse_line parses a line of output from the ytarchive process.
+    /// parse_line parses a line of output from the yt-dlp process.
     ///
     /// Sample output:
     ///
-    ///   ytarchive 0.3.1-15663af
-    ///   Stream starts at 2022-03-14T14:00:00+00:00 in 11075 seconds. Waiting for this time to elapse...
-    ///   Stream is 30 seconds late...
-    ///   Selected quality: 1080p60 (h264)
-    ///   Video Fragments: 1215; Audio Fragments: 1215; Total Downloaded: 133.12MiB
-    ///   Download Finished
-    ///   Muxing final file...
-    ///   Final file: /path/to/output.mp4
+    ///   [youtube] VIDEO_ID: Waiting for VIDEO_ID - expected start time is ...
+    ///   [youtube] VIDEO_ID: Waiting for 30 seconds
+    ///   [hlsFfmpeg] Destination: temp/20220314 Title [Channel] (VIDEO_ID).mkv
+    ///   [download] 1 fragments downloaded (2.34MiB)
+    ///   [Merger] Merging formats into "output.mkv"
+    ///   ERROR: ...
     pub fn parse_line(&mut self, line: &str) {
         self.last_output = Some(line.to_string());
         self.last_update = chrono::Utc::now();
 
-        if line.starts_with("Video Fragments: ") {
-            self.state = YTAState::Recording;
-            let mut parts = line.split(';').map(|s| s.split(':').nth(1).unwrap_or(""));
-            if let Some(x) = parts.next() {
-                self.video_fragments = x.trim().parse().ok();
-            };
-            if let Some(x) = parts.next() {
-                self.audio_fragments = x.trim().parse().ok();
-            };
-            if let Some(x) = parts.next() {
-                self.total_size = Some(strip_ansi(x.trim()));
-            };
-            return;
-        } else if line.starts_with("Audio Fragments: ") {
-            self.state = YTAState::Recording;
-            let mut parts = line.split(';').map(|s| s.split(':').nth(1).unwrap_or(""));
-            if let Some(x) = parts.next() {
-                self.audio_fragments = x.trim().parse().ok();
-            };
-            if let Some(x) = parts.next() {
-                self.total_size = Some(strip_ansi(x.trim()));
-            };
-            return;
-        }
+        let line = strip_ansi(line);
 
-        // New versions of ytarchive prepend a timestamp to the output
-        // Sample line
-        // 2024/04/16 16:25:31
         lazy_static! {
-            static ref TIMESTAMP_RE: Regex = Regex::new(r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}")
-                .expect("Failed to compile regex for detecting yta output timestamp");
+            static ref FRAGMENT_RE: Regex =
+                Regex::new(r"\[download\] (\d+) fragments? downloaded \(([^)]+)\)")
+                    .expect("Failed to compile yt-dlp fragment regex");
+            static ref CONCURRENT_PROGRESS_RE: Regex =
+                Regex::new(r"^\d+: \[download\]\s+([\d.]+\S+) at")
+                    .expect("Failed to compile yt-dlp concurrent progress regex");
+            static ref WAITING_TIME_RE: Regex =
+                Regex::new(r"expected start time is (\S+)")
+                    .expect("Failed to compile yt-dlp waiting time regex");
+            static ref FORMAT_RE: Regex =
+                Regex::new(r"\[info\] \S+: Downloading \d+ format\(s\): (.+)")
+                    .expect("Failed to compile yt-dlp format regex");
         }
-        let line = if line.len() > 20 && TIMESTAMP_RE.is_match(line) {
-            line[20..].trim()
-        } else {
-            line
-        };
 
-        if self.version == None && line.starts_with("ytarchive ") {
-            self.version = Some(strip_ansi(&line[10..]));
-        } else if self.video_quality == None && line.starts_with("Selected quality: ") {
-            self.video_quality = Some(strip_ansi(&line[18..]));
-        } else if line.starts_with("Stream starts at ") {
-            let date = DateTime::parse_from_rfc3339(&line[17..42])
-                .ok()
+        if line.contains("[youtube]") && line.contains("Waiting for") {
+            let date = WAITING_TIME_RE
+                .captures(&line)
+                .and_then(|c| c.get(1))
+                .and_then(|m| DateTime::parse_from_rfc3339(m.as_str()).ok())
                 .map(|d| d.into());
             self.state = YTAState::Waiting(date);
-        } else if line.starts_with("Stream is ") || line.starts_with("Waiting for stream") {
-            self.state = YTAState::Waiting(None);
-        } else if line.starts_with("Muxing final file") {
+        } else if let Some(stripped) = line.strip_prefix("[hlsFfmpeg] Destination: ") {
+            // HLS download: capture output filename
+            self.state = YTAState::Recording;
+            self.output_file = Some(stripped.trim().to_string());
+        } else if let Some(stripped) = line.strip_prefix("[download] Destination: ") {
+            // DASH/direct download: track the last destination (merged file comes last)
+            self.state = YTAState::Recording;
+            self.output_file = Some(stripped.trim().to_string());
+        } else if line.starts_with("[Merger] Merging formats into \"") {
             self.state = YTAState::Muxing;
-        } else if line.starts_with("Livestream has been processed") {
-            self.state = YTAState::AlreadyProcessed;
-        } else if line.starts_with("Livestream has ended and is being processed")
-            || line.contains("use yt-dlp to download it.")
-        {
-            self.state = YTAState::Ended;
-        } else if line.starts_with("Final file: ") {
-            self.state = YTAState::Finished;
-            self.output_file = Some(strip_ansi(&line[12..]));
-        } else if line.contains("User Interrupt") {
-            self.state = YTAState::Interrupted;
-        } else if line.contains("Error retrieving player response")
-            || line.contains("unable to retrieve")
-            || line.contains("error writing the muxcmd file")
-            || line.contains("Something must have gone wrong with ffmpeg")
-            || line.contains("At least one error occurred")
-        {
+            let filename = line
+                .trim_start_matches("[Merger] Merging formats into \"")
+                .trim_end_matches('"');
+            self.output_file = Some(filename.to_string());
+        } else if let Some(caps) = CONCURRENT_PROGRESS_RE.captures(&line) {
+            // Concurrent fragment worker progress: "1: [download] 1.29GiB at ..."
+            self.state = YTAState::Recording;
+            if let Some(s) = caps.get(1) {
+                self.total_size = Some(s.as_str().to_string());
+            }
+        } else if let Some(caps) = FRAGMENT_RE.captures(&line) {
+            self.state = YTAState::Recording;
+            if let Some(n) = caps.get(1).and_then(|m| m.as_str().parse().ok()) {
+                self.video_fragments = Some(n);
+            }
+            if let Some(s) = caps.get(2) {
+                self.total_size = Some(s.as_str().to_string());
+            }
+        } else if line.starts_with("[download] Downloading fragment") {
+            self.state = YTAState::Recording;
+        } else if let Some(caps) = FORMAT_RE.captures(&line) {
+            self.video_quality = Some(caps[1].to_string());
+        } else if line.starts_with("ERROR:") {
             self.state = YTAState::Errored;
-        } else if line.trim().is_empty()
-            || line.contains("Loaded cookie file")
-            || line.starts_with("Video Title: ")
-            || line.starts_with("Channel: ")
-            || line.starts_with("Waiting for this time to elapse")
-            || line.starts_with("Download Finished")
+        } else if line.contains("KeyboardInterrupt") || line.contains("User Interrupt") {
+            self.state = YTAState::Interrupted;
+        } else if line.contains("This live event has ended")
+            || line.contains("This is a past livestream")
         {
-            // Ignore
-        } else {
-            warn!("Unknown ytarchive output: {}", line);
+            self.state = YTAState::AlreadyProcessed;
+        } else if line.starts_with("[wait] ") {
+            // --wait-for-video countdown
+            self.state = YTAState::Waiting(None);
+        } else if !line.trim().is_empty()
+            && !line.starts_with("[youtube]")
+            && !line.starts_with("[info]")
+            && !line.starts_with("[debug]")
+            && !line.starts_with("WARNING:")
+            && !line.starts_with("[download]")
+            && !line.starts_with("[wait]")
+            && !line.starts_with("frame=")
+            && !line.trim_start().starts_with("frame=")
+            && !line.contains("[https @ ")
+            && !line.contains("[ffmpeg @ ")
+            && !line.contains("[hls @ ")
+            && !CONCURRENT_PROGRESS_RE.is_match(&line)
+        {
+            debug!("Unrecognized yt-dlp output: {}", line);
         }
     }
 }

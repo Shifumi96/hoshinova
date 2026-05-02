@@ -1,18 +1,25 @@
 # hoshinova configuration file
 # Copy this file to config.toml and update it as needed.
 
-[ytarchive]
-executable_path = "ytarchive"
+[ytdlp]
+executable_path = "yt-dlp"
 working_directory = "temp"
 args = [
-  "--vp9", "--thumbnail", "--add-metadata", "--threads", "4",
-  "--retry-stream", "30",
-  "--output", "%(upload_date)s %(title)s [%(channel)s] (%(id)s)"
+  "--embed-thumbnail", "--add-metadata", "--embed-chapters",
+  "--concurrent-fragments", "4",
+  "--windows-filenames",
+  "--js-runtimes", "node",
+  "--output", "%(upload_date)s %(title)s [%(channel)s] (%(id)s).%(ext)s"
 ]
-quality = "best"
-# Delay between starting ytarchive processes. Increase this number if you get
+# Format selector passed to yt-dlp -f
+format = "bestvideo+bestaudio/best"
+# Download from the beginning of the stream (recommended for archiving, add manually if needed)
+# Add "--live-from-start" to args if you want this behaviour, literally broken as of now when used with cookies https://github.com/yt-dlp/yt-dlp/issues/15274
+# Delay between starting yt-dlp processes. Increase this number if you get
 # rate limited by YouTube.
 delay_start = "1s"
+# Cookies file for member-only streams (Netscape format, export with a browser extension)
+# cookies_file = "/path/to/cookies.txt"
 
 [scraper.rss]
 poll_interval = "30s"

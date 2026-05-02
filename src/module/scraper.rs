@@ -83,8 +83,14 @@ impl RSS {
             .send()
             .await
             .context("Failed to fetch RSS feed")?;
+        let status = res.status();
+        let body = res.bytes().await.context("Failed to read RSS feed body")?;
+        if !status.is_success() {
+            let preview = std::str::from_utf8(&body[..body.len().min(200)]).unwrap_or("(binary)");
+            anyhow::bail!("RSS feed returned HTTP {}: {}", status, preview);
+        }
         let feed: RSSFeed =
-            quick_xml::de::from_slice(&res.bytes().await.context("Failed to read RSS feed body")?)
+            quick_xml::de::from_slice(&body)
                 .context("Failed to parse RSS feed")?;
 
         // Find matching videos
@@ -142,7 +148,7 @@ impl RSS {
         let config = self.config.read().await;
         stream::iter(config.channel.clone())
             .map(move |channel| self.run_one(scraped.clone(), channel))
-            .buffer_unordered(4)
+            .buffer_unordered(1)
             .filter_map(|one| async { one.map_err(|e| error!("Failed to run RSS: {:?}", e)).ok() })
             .flatten()
     }
@@ -169,7 +175,7 @@ impl RSS {
 impl Module for RSS {
     fn new(config: Arc<RwLock<config::Config>>) -> Self {
         let client = Client::builder()
-            .user_agent(APP_USER_AGENT)
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
             .timeout(Duration::from_secs(30))
             .build()
             .expect("Failed to create client");

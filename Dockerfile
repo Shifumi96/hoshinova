@@ -45,20 +45,16 @@ COPY --from=web-builder /src/web/dist /src/web/dist
 RUN touch src/main.rs && \
     cargo build --locked --release --target x86_64-unknown-linux-musl
 
-# Build ytarchive
-FROM golang:1.20-alpine AS ytarchive-builder
-WORKDIR /src
-RUN set -ex; \
-    apk add --no-cache git; \
-    git clone https://github.com/Kethsar/ytarchive.git; \
-    cd ytarchive; \
-    git checkout v0.3.2; \
-    go build .
+# Install yt-dlp
+FROM alpine AS ytdlp-fetcher
+RUN apk add --no-cache curl && \
+    curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && \
+    chmod +x /usr/local/bin/yt-dlp
 
 FROM alpine AS runner
 WORKDIR /app
-RUN apk add --no-cache ffmpeg
-COPY --from=ytarchive-builder /src/ytarchive/ytarchive /usr/local/bin/ytarchive
+RUN apk add --no-cache ffmpeg python3 nodejs
+COPY --from=ytdlp-fetcher /usr/local/bin/yt-dlp /usr/local/bin/yt-dlp
 
 USER 1000
 COPY --from=rust-builder --chown=1000:1000 \
