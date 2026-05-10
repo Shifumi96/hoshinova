@@ -310,12 +310,15 @@ impl YtDlp {
             .map(|s| s.success())
             .unwrap_or(false);
 
-        // Mark as finished when process exits successfully
-        if exit_ok
+        // Mark as finished when process exits successfully, or when muxing
+        // completed even if yt-dlp returned a non-zero exit code (e.g. due to
+        // skipped fragments that don't prevent a usable output file).
+        if (exit_ok
             && matches!(
                 status.state,
                 YTAState::Recording | YTAState::Muxing | YTAState::Idle
-            )
+            ))
+            || status.state == YTAState::Muxing
         {
             status.state = YTAState::Finished;
             let _ = bus
@@ -620,7 +623,14 @@ impl YTAStatus {
         } else if let Some(caps) = FORMAT_RE.captures(&line) {
             self.video_quality = Some(caps[1].to_string());
         } else if line.starts_with("ERROR:") {
-            self.state = YTAState::Errored;
+            // Only error out if we haven't started recording/muxing yet.
+            // Non-fatal errors (e.g. skipped fragments) during download should
+            // not abort a recording that is otherwise progressing.
+            if !matches!(self.state, YTAState::Recording | YTAState::Muxing) {
+                self.state = YTAState::Errored;
+            } else {
+                debug!("Ignoring non-fatal yt-dlp error during recording: {}", line);
+            }
         } else if line.contains("KeyboardInterrupt") || line.contains("User Interrupt") {
             self.state = YTAState::Interrupted;
         } else if line.contains("This live event has ended")
